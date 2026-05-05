@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+#!/usr/bin/env python3
 import time
 import mysql.connector
 from RPLCD.i2c import CharLCD
@@ -18,6 +18,24 @@ lcd = CharLCD(
     rows=4,
     charmap='A00'
 )
+
+def normalize(text):
+    """Remplace les caractères accentués non supportés par le charset A00."""
+    replacements = {
+        'ê': 'e', 'é': 'e', 'è': 'e', 'ë': 'e',
+        'à': 'a', 'â': 'a', 'ä': 'a',
+        'î': 'i', 'ï': 'i',
+        'ô': 'o', 'ö': 'o',
+        'û': 'u', 'ù': 'u', 'ü': 'u',
+        'ç': 'c',
+        'É': 'E', 'È': 'E', 'Ê': 'E',
+        'À': 'A', 'Â': 'A',
+        'Î': 'I', 'Ô': 'O', 'Û': 'U',
+        'Ç': 'C',
+    }
+    for accented, plain in replacements.items():
+        text = text.replace(accented, plain)
+    return text
 
 def get_last_scanned():
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -39,11 +57,12 @@ def show_equipment(name, status, qr):
     lcd.cursor_pos = (0, 0)
     lcd.write_string("Dernier scan:")
     lcd.cursor_pos = (1, 0)
-    lcd.write_string(name[:20].ljust(20))
+    lcd.write_string(normalize(name)[:20].ljust(20))
     lcd.cursor_pos = (2, 0)
-    lcd.write_string(status[:20].ljust(20))
+    lcd.write_string(normalize(status)[:20].ljust(20))
     lcd.cursor_pos = (3, 0)
     lcd.write_string(qr[:20].ljust(20))
+
 try:
     while True:
         try:
