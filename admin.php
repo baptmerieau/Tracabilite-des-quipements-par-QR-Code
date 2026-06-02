@@ -58,6 +58,59 @@ function colOk(PDO $pdo, string $t, string $c): bool {
     return $cache[$k];
 }
 
+/* ── Génère le dump SQL complet d'une liste de tables ── */
+function buildSqlDump(PDO $pdo, array $tables): string {
+    $sql  = "-- Sauvegarde automatique Traçabilité Sodiaal\n";
+    $sql .= "-- Date : " . date('Y-m-d H:i:s') . "\n\n";
+    $sql .= "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n";
+    foreach ($tables as $tbl) {
+        if (!tableOk($pdo, $tbl)) continue;
+        $create = $pdo->query("SHOW CREATE TABLE `$tbl`")->fetch(PDO::FETCH_NUM);
+        $sql   .= "DROP TABLE IF EXISTS `$tbl`;\n";
+        $sql   .= $create[1] . ";\n\n";
+        $rows   = $pdo->query("SELECT * FROM `$tbl`")->fetchAll(PDO::FETCH_ASSOC);
+        if (!empty($rows)) {
+            $cols    = '`' . implode('`,`', array_keys($rows[0])) . '`';
+            $chunks  = [];
+            foreach ($rows as $row) {
+                $vals = array_map(fn($v) => $v === null ? 'NULL' : $pdo->quote((string)$v), $row);
+                $chunks[] = '(' . implode(',', $vals) . ')';
+            }
+            $sql .= "INSERT INTO `$tbl` ($cols) VALUES\n" . implode(",\n", $chunks) . ";\n\n";
+        }
+    }
+    $sql .= "SET FOREIGN_KEY_CHECKS=1;\n";
+    return $sql;
+}
+
+/* ── Génère un CSV UTF-8 avec BOM pour une table ── */
+function buildCsvForTable(PDO $pdo, string $tbl): string {
+    $rows = $pdo->query("SELECT * FROM `$tbl`")->fetchAll(PDO::FETCH_ASSOC);
+    if (empty($rows)) return "\xEF\xBB\xBF";  // BOM seul si vide
+    $out = "\xEF\xBB\xBF";
+    // En-têtes
+    $out .= implode(';', array_map(fn($h) => '"' . str_replace('"', '""', $h) . '"', array_keys($rows[0]))) . "\r\n";
+    foreach ($rows as $row) {
+        $out .= implode(';', array_map(fn($v) => $v === null ? '' : '"' . str_replace('"', '""', (string)$v) . '"', $row)) . "\r\n";
+    }
+    return $out;
+}
+
+/* ── Crée un ZIP en mémoire contenant plusieurs fichiers ── */
+function buildZip(array $files): string {
+    // $files = ['nom_fichier.ext' => 'contenu string']
+    $tmpZip = tempnam(sys_get_temp_dir(), 'zip_');
+    $zip = new ZipArchive();
+    $zip->open($tmpZip, ZipArchive::OVERWRITE);
+    foreach ($files as $name => $content) {
+        $zip->addFromString($name, $content);
+    }
+    $zip->close();
+    $data = file_get_contents($tmpZip);
+    unlink($tmpZip);
+    return $data;
+}
+
 /* ═══════════════════════════════════
    AUTH
 ═══════════════════════════════════ */
@@ -310,54 +363,46 @@ if ($action === 'close_repair') {
 }
 
 /* ═══════════════════════════════════════════════════════
-   IMPORT — SAUVEGARDE + RESET BASE DE DONNÉES
+   SAUVEGARDE + RESET BASE DE DONNÉES
+   → Génère un .zip contenant : dump.sql + un .csv par table
 ═══════════════════════════════════════════════════════ */
 if ($action === 'db_backup_reset') {
     try {
-        // 1. Génération du dump SQL (tables principales)
-        $tables = ['equipements', 'utilisateurs', 'reparations', 'reparation_logs', 'equipement_logs', 'movements'];
-        $sql    = "-- Sauvegarde automatique Traçabilité Sodiaal\n";
-        $sql   .= "-- Date : " . date('Y-m-d H:i:s') . "\n\n";
-        $sql   .= "SET FOREIGN_KEY_CHECKS=0;\n\n";
+        $tables      = ['equipements', 'utilisateurs', 'reparations', 'reparation_logs', 'equipement_logs', 'movements'];
+        $backupDir   = __DIR__ . '/backups';
+        $prefix      = 'backup_' . date('Ymd_His');
 
+        if (!is_dir($backupDir)) mkdir($backupDir, 0750, true);
+
+        // 1. Dump SQL
+        $sqlContent = buildSqlDump($pdo, $tables);
+        file_put_contents($backupDir . '/' . $prefix . '.sql', $sqlContent);
+
+        // 2. CSVs par table (dans un sous-dossier ou dans le ZIP)
+        $zipFiles = [$prefix . '.sql' => $sqlContent];
         foreach ($tables as $tbl) {
             if (!tableOk($pdo, $tbl)) continue;
-
-            // Structure
-            $create = $pdo->query("SHOW CREATE TABLE `$tbl`")->fetch(PDO::FETCH_NUM);
-            $sql   .= "DROP TABLE IF EXISTS `$tbl`;\n";
-            $sql   .= $create[1] . ";\n\n";
-
-            // Données
-            $rows = $pdo->query("SELECT * FROM `$tbl`")->fetchAll(PDO::FETCH_ASSOC);
-            if (!empty($rows)) {
-                $cols  = '`' . implode('`,`', array_keys($rows[0])) . '`';
-                $sql  .= "INSERT INTO `$tbl` ($cols) VALUES\n";
-                $chunks = [];
-                foreach ($rows as $row) {
-                    $vals = array_map(fn($v) => $v === null ? 'NULL' : $pdo->quote((string)$v), $row);
-                    $chunks[] = '(' . implode(',', $vals) . ')';
-                }
-                $sql .= implode(",\n", $chunks) . ";\n\n";
-            }
+            $csvContent = buildCsvForTable($pdo, $tbl);
+            // Sauvegarde CSV individuelle aussi sur disque
+            file_put_contents($backupDir . '/' . $prefix . '_' . $tbl . '.csv', $csvContent);
+            $zipFiles[$prefix . '_' . $tbl . '.csv'] = $csvContent;
         }
-        $sql .= "SET FOREIGN_KEY_CHECKS=1;\n";
 
-        // 2. Enregistrement du fichier de sauvegarde
-        $backupDir = __DIR__ . '/backups';
-        if (!is_dir($backupDir)) mkdir($backupDir, 0750, true);
-        $filename  = 'backup_' . date('Ymd_His') . '.sql';
-        $filepath  = $backupDir . '/' . $filename;
-        file_put_contents($filepath, $sql);
+        // 3. Création du ZIP regroupant SQL + tous les CSVs
+        if (class_exists('ZipArchive')) {
+            $zipContent = buildZip($zipFiles);
+            file_put_contents($backupDir . '/' . $prefix . '.zip', $zipContent);
+        }
 
-        // 3. Reset des tables (vidage dans l'ordre pour respecter les FK)
+        // 4. Reset des tables (ordre FK-safe)
         $pdo->exec("SET FOREIGN_KEY_CHECKS=0");
-        $resetTables = ['reparation_logs', 'equipement_logs', 'movements', 'reparations', 'equipements', 'utilisateurs'];
-        foreach ($resetTables as $tbl)
+        $resetOrder = ['reparation_logs', 'equipement_logs', 'movements', 'reparations', 'equipements', 'utilisateurs'];
+        foreach ($resetOrder as $tbl)
             if (tableOk($pdo, $tbl)) $pdo->exec("TRUNCATE TABLE `$tbl`");
         $pdo->exec("SET FOREIGN_KEY_CHECKS=1");
 
-        goAdmin("✅ Sauvegarde créée ($filename) et base réinitialisée avec succès.", 'import');
+        $zipNote = class_exists('ZipArchive') ? " + archive ZIP" : '';
+        goAdmin("✅ Sauvegarde créée ($prefix.sql, CSV par table{$zipNote}) et base réinitialisée.", 'import');
     } catch (Exception $e) {
         goAdmin('❌ Erreur lors du reset : ' . $e->getMessage(), 'import');
     }
@@ -367,7 +412,6 @@ if ($action === 'db_backup_reset') {
    IMPORT — FICHIER CSV
 ═══════════════════════════════════════════════════════ */
 if ($action === 'import_csv') {
-    // Colonnes obligatoires (mapping flexible nom_csv => nom_bdd)
     $knownCols = [
         'nom'                   => 'nom',
         'type'                  => 'type',
@@ -395,33 +439,27 @@ if ($action === 'import_csv') {
         'état'                  => 'etat_reparation',
     ];
 
-    if (!isset($_FILES['csv_file']) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK) {
+    if (!isset($_FILES['csv_file']) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK)
         goAdmin('❌ Aucun fichier CSV reçu ou erreur d\'upload.', 'import');
-    }
 
     $tmpPath   = $_FILES['csv_file']['tmp_name'];
     $separator = ($_POST['csv_sep'] ?? ';') ?: ';';
     $handle    = fopen($tmpPath, 'r');
-
     if (!$handle) goAdmin('❌ Impossible de lire le fichier CSV.', 'import');
 
-    // BOM UTF-8
     $bom = fread($handle, 3);
     if ($bom !== "\xEF\xBB\xBF") rewind($handle);
 
     $header = fgetcsv($handle, 0, $separator);
     if (!$header) { fclose($handle); goAdmin('❌ Fichier CSV vide ou entête introuvable.', 'import'); }
 
-    // Nettoyage entêtes
     $header = array_map(fn($h) => mb_strtolower(trim(str_replace([' ', '-'], '_', $h))), $header);
 
-    // Résolution colonnes disponibles en BDD
-    $colMap = []; // index_csv => nom_bdd
+    $colMap = [];
     foreach ($header as $idx => $h) {
         $bddCol = $knownCols[$h] ?? null;
-        if ($bddCol && ($bddCol === 'nom' || $bddCol === 'type' || $bddCol === 'numero_serie' || $bddCol === 'localisation' || $bddCol === 'statut' || $bddCol === 'qr_code' || colOk($pdo, 'equipements', $bddCol))) {
+        if ($bddCol && (in_array($bddCol, ['nom','type','numero_serie','localisation','statut','qr_code']) || colOk($pdo, 'equipements', $bddCol)))
             $colMap[$idx] = $bddCol;
-        }
     }
 
     if (!in_array('nom', $colMap)) {
@@ -429,42 +467,25 @@ if ($action === 'import_csv') {
         goAdmin('❌ Colonne "nom" introuvable dans le CSV. Vérifiez les entêtes.', 'import');
     }
 
-    $inserted = 0;
-    $skipped  = 0;
-    $errors   = [];
-
+    $inserted = 0; $skipped = 0;
     $pdo->beginTransaction();
     try {
         while (($row = fgetcsv($handle, 0, $separator)) !== false) {
-            if (count(array_filter($row, fn($v) => trim($v) !== '')) === 0) continue; // ligne vide
-
+            if (count(array_filter($row, fn($v) => trim($v) !== '')) === 0) continue;
             $data = [];
             foreach ($colMap as $csvIdx => $bddCol) {
                 $val = trim($row[$csvIdx] ?? '');
                 if ($val !== '') $data[$bddCol] = $val;
             }
-
             if (empty($data['nom'])) { $skipped++; continue; }
-
-            // QR code auto
-            if (empty($data['qr_code']))
-                $data['qr_code'] = 'QR-' . uniqid();
-
-            // Statut par défaut
-            if (empty($data['statut']))
-                $data['statut'] = 'Disponible';
-
-            // etat_reparation par défaut
+            if (empty($data['qr_code']))  $data['qr_code']  = 'QR-' . uniqid();
+            if (empty($data['statut']))   $data['statut']   = 'Disponible';
             if (colOk($pdo, 'equipements', 'etat_reparation') && empty($data['etat_reparation']))
                 $data['etat_reparation'] = 'RAS';
-
-            // Exclure colonnes inexistantes en BDD
             $finalData = [];
-            foreach ($data as $col => $val) {
-                if (in_array($col, ['nom', 'type', 'numero_serie', 'localisation', 'statut', 'qr_code']) || colOk($pdo, 'equipements', $col))
+            foreach ($data as $col => $val)
+                if (in_array($col, ['nom','type','numero_serie','localisation','statut','qr_code']) || colOk($pdo, 'equipements', $col))
                     $finalData[$col] = $val;
-            }
-
             $cols = implode(',', array_keys($finalData));
             $plh  = implode(',', array_fill(0, count($finalData), '?'));
             $pdo->prepare("INSERT INTO equipements($cols) VALUES($plh)")->execute(array_values($finalData));
@@ -474,9 +495,86 @@ if ($action === 'import_csv') {
         fclose($handle);
         goAdmin("✅ Import CSV terminé : $inserted équipement(s) importé(s)" . ($skipped ? ", $skipped ligne(s) ignorée(s)." : '.'), 'import');
     } catch (Exception $e) {
-        $pdo->rollBack();
-        fclose($handle);
-        goAdmin('❌ Erreur lors de l\'import : ' . $e->getMessage(), 'import');
+        $pdo->rollBack(); fclose($handle);
+        goAdmin('❌ Erreur lors de l\'import CSV : ' . $e->getMessage(), 'import');
+    }
+}
+
+/* ═══════════════════════════════════════════════════════
+   IMPORT — FICHIER SQL
+   Restaure un dump .sql précédemment généré par ce système
+═══════════════════════════════════════════════════════ */
+if ($action === 'import_sql') {
+    if (!isset($_FILES['sql_file']) || $_FILES['sql_file']['error'] !== UPLOAD_ERR_OK)
+        goAdmin('❌ Aucun fichier SQL reçu ou erreur d\'upload.', 'import');
+
+    $sqlRaw = file_get_contents($_FILES['sql_file']['tmp_name']);
+    if ($sqlRaw === false || trim($sqlRaw) === '')
+        goAdmin('❌ Fichier SQL vide ou illisible.', 'import');
+
+    // Sécurité basique : on n'accepte que nos propres dumps
+    if (!str_contains($sqlRaw, 'Traçabilité Sodiaal') && !str_contains($sqlRaw, 'Tracabilite Sodiaal') && !str_contains($sqlRaw, 'FOREIGN_KEY_CHECKS'))
+        goAdmin('❌ Ce fichier ne semble pas être un dump valide généré par ce système.', 'import');
+
+    try {
+        $pdo->exec("SET NAMES utf8mb4");
+        $pdo->exec("SET FOREIGN_KEY_CHECKS=0");
+
+        // Découpage en instructions SQL individuelles
+        // On retire les commentaires -- et les lignes vides, puis on split sur ;
+        $lines = explode("\n", $sqlRaw);
+        $clean = [];
+        foreach ($lines as $line) {
+            $line = rtrim($line);
+            if ($line === '' || str_starts_with($line, '--') || str_starts_with($line, '/*')) continue;
+            $clean[] = $line;
+        }
+        $fullSql  = implode("\n", $clean);
+
+        // Split en statements (respecte les ; dans les chaînes grâce à un état simple)
+        $statements = [];
+        $current    = '';
+        $inString   = false;
+        $strChar    = '';
+        $len        = strlen($fullSql);
+
+        for ($i = 0; $i < $len; $i++) {
+            $char = $fullSql[$i];
+            if (!$inString && ($char === "'" || $char === '"')) {
+                $inString = true; $strChar = $char;
+            } elseif ($inString && $char === $strChar && ($i === 0 || $fullSql[$i-1] !== '\\')) {
+                $inString = false;
+            }
+            if (!$inString && $char === ';') {
+                $stmt = trim($current);
+                if ($stmt !== '') $statements[] = $stmt;
+                $current = '';
+            } else {
+                $current .= $char;
+            }
+        }
+        if (trim($current) !== '') $statements[] = trim($current);
+
+        $executed = 0;
+        foreach ($statements as $stmt) {
+            if (trim($stmt) === '') continue;
+            // N'autoriser que les opérations attendues dans un dump
+            $upper = strtoupper(ltrim($stmt));
+            if (!str_starts_with($upper, 'DROP')
+                && !str_starts_with($upper, 'CREATE')
+                && !str_starts_with($upper, 'INSERT')
+                && !str_starts_with($upper, 'SET')
+                && !str_starts_with($upper, 'TRUNCATE')
+                && !str_starts_with($upper, 'ALTER')) continue;
+            $pdo->exec($stmt);
+            $executed++;
+        }
+
+        $pdo->exec("SET FOREIGN_KEY_CHECKS=1");
+        goAdmin("✅ Import SQL réussi — $executed instructions exécutées.", 'import');
+    } catch (Exception $e) {
+        try { $pdo->exec("SET FOREIGN_KEY_CHECKS=1"); } catch (Exception $ignored) {}
+        goAdmin('❌ Erreur lors de l\'import SQL : ' . $e->getMessage(), 'import');
     }
 }
 
@@ -513,8 +611,8 @@ if (!isset($_SESSION['has_ticket_col'])) {
     try { $pdo->query("SELECT numero_ticket FROM reparations LIMIT 0"); $_SESSION['has_ticket_col'] = 1; }
     catch (PDOException $ex) { $_SESSION['has_ticket_col'] = 0; }
 }
-$reparations = [];
-$repTableOk  = tableOk($pdo, 'reparations');
+$reparations  = [];
+$repTableOk   = tableOk($pdo, 'reparations');
 $hasTicketCol = $repTableOk && (bool)($_SESSION['has_ticket_col'] ?? 0);
 
 if ($repTableOk) {
@@ -532,7 +630,7 @@ if ($repTableOk) {
 $closedRepairs = [];
 if ($repTableOk) {
     try {
-        $tcSel        = $hasTicketCol ? "r.numero_ticket," : "'' AS numero_ticket,";
+        $tcSel = $hasTicketCol ? "r.numero_ticket," : "'' AS numero_ticket,";
         $closedRepairs = $pdo->query(
             "SELECT r.id,r.statut,r.panne_declaree,r.diagnostic,r.pieces_changees,
                     r.technicien,r.date_ouverture,r.date_cloture,r.cout_reparation,{$tcSel}
@@ -540,8 +638,7 @@ if ($repTableOk) {
              FROM reparations r
              JOIN equipements e ON e.id=r.equipement_id
              WHERE r.statut IN ('Réparé','Restitué','Clôturé','Hors service')
-             ORDER BY r.date_cloture DESC
-             LIMIT 80"
+             ORDER BY r.date_cloture DESC LIMIT 80"
         )->fetchAll(PDO::FETCH_ASSOC);
     } catch (PDOException $e) { $closedRepairs = []; }
 }
@@ -570,15 +667,25 @@ try {
     $dbStats['reparations']  = $repTableOk ? (int)$pdo->query("SELECT COUNT(*) FROM reparations")->fetchColumn() : 0;
 } catch (PDOException $e) {}
 
-/* Sauvegardes existantes */
+/* Sauvegardes existantes — on liste les ZIP en priorité, puis SQL/CSV orphelins */
 $backupFiles = [];
 $backupDir   = __DIR__ . '/backups';
 if (is_dir($backupDir)) {
-    $files = glob($backupDir . '/backup_*.sql');
-    if ($files) {
-        rsort($files);
-        foreach (array_slice($files, 0, 10) as $f)
-            $backupFiles[] = ['name' => basename($f), 'size' => round(filesize($f) / 1024, 1), 'date' => date('d/m/Y H:i', filemtime($f))];
+    // ZIP d'abord (contiennent SQL + CSVs)
+    $zips = glob($backupDir . '/backup_*.zip') ?: [];
+    rsort($zips);
+    foreach (array_slice($zips, 0, 8) as $f)
+        $backupFiles[] = ['name' => basename($f), 'size' => round(filesize($f)/1024,1), 'date' => date('d/m/Y H:i', filemtime($f)), 'type' => 'zip'];
+
+    // SQL seuls (si ZipArchive indispo)
+    $sqls = glob($backupDir . '/backup_*.sql') ?: [];
+    rsort($sqls);
+    foreach (array_slice($sqls, 0, 5) as $f) {
+        $name = basename($f);
+        // Ne pas doublonner si le ZIP du même préfixe existe
+        $prefix = preg_replace('/\.sql$/', '', $name);
+        if (!file_exists($backupDir . '/' . $prefix . '.zip'))
+            $backupFiles[] = ['name' => $name, 'size' => round(filesize($f)/1024,1), 'date' => date('d/m/Y H:i', filemtime($f)), 'type' => 'sql'];
     }
 }
 ?>
@@ -599,17 +706,14 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
 .glass{background:var(--card);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:24px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
 .section-title{font-weight:900;letter-spacing:-.02em;margin-bottom:14px}
 .muted{color:var(--muted)}
-/* Nav tabs */
 .admin-nav{display:flex;gap:4px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:6px;flex-wrap:wrap}
 .admin-nav a{padding:10px 18px;border-radius:12px;color:var(--muted);text-decoration:none;font-weight:700;font-size:.88rem;transition:all .18s}
 .admin-nav a.active{background:linear-gradient(135deg,rgba(99,102,241,.35),rgba(168,85,247,.25));color:#fff;border:1px solid rgba(99,102,241,.4)}
 .admin-nav a:hover:not(.active){background:rgba(255,255,255,.07);color:#fff}
-/* Tables */
 .table-wrap{overflow:hidden;border-radius:18px}
 .table thead th{background:rgba(255,255,255,.07)!important;color:var(--muted);border-color:rgba(255,255,255,.08);font-size:.8rem;text-transform:uppercase;letter-spacing:.06em}
 .table tbody td{background:rgba(255,255,255,.02)!important;color:var(--txt);border-color:rgba(255,255,255,.06)}
 .table tbody tr:hover td{background:rgba(255,255,255,.05)!important}
-/* Forms */
 .form-control,.form-select{background:rgba(255,255,255,.07)!important;color:#fff!important;border:1px solid rgba(255,255,255,.12)!important;border-radius:10px!important;padding:9px 12px!important;box-shadow:none!important}
 .form-control::placeholder{color:#64748b}
 .form-control:focus,.form-select:focus{border-color:rgba(99,102,241,.5)!important}
@@ -622,32 +726,39 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
 .btn-secondary{border-radius:10px;font-weight:700}
 .btn-sm{font-size:.78rem;padding:5px 12px}
 .btn-outline-light{border-color:rgba(255,255,255,.15)!important;color:#fff!important;border-radius:10px;font-weight:700}
-/* Réparation cards */
 .rep-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px;margin-bottom:10px;transition:border-color .2s}
 .rep-card:hover{border-color:rgba(99,102,241,.35)}
 .rep-card.haute{border-left:3px solid #f97316}
 .rep-card.critique{border-left:3px solid #ef4444}
 .wf-bar{display:flex;gap:3px;margin-top:10px}
 .wf-bar div{flex:1;height:6px;border-radius:3px}
-/* Timeline */
 .tl-line{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.06)}
 .tl-line:last-child{border-bottom:none}
 .tl-dot{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;font-size:.8rem}
-/* Ticket badge */
 .ticket-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(6,182,212,.10);border:1px solid rgba(6,182,212,.28);color:#67e8f9;padding:3px 10px;border-radius:8px;font-size:.75rem;font-weight:700;font-family:monospace;cursor:pointer;user-select:all;transition:background .15s}
 .ticket-badge:hover{background:rgba(6,182,212,.2)}
 .flash{border-radius:12px;border:none;font-weight:600}
 .search-bar{background:rgba(255,255,255,.06)!important;color:#fff!important;border:1px solid rgba(255,255,255,.12)!important;border-radius:12px;padding:9px 14px;box-shadow:none!important}
 .search-bar::placeholder{color:#64748b}
 /* ── Import ── */
-.import-zone{border:2px dashed rgba(99,102,241,.4);border-radius:16px;padding:32px;text-align:center;transition:border-color .2s,background .2s;cursor:pointer}
+.import-zone{border:2px dashed rgba(99,102,241,.4);border-radius:16px;padding:28px;text-align:center;transition:border-color .2s,background .2s;cursor:pointer}
 .import-zone:hover,.import-zone.dragover{border-color:rgba(99,102,241,.9);background:rgba(99,102,241,.07)}
 .import-zone input[type=file]{display:none}
+.import-zone-sql{border:2px dashed rgba(245,158,11,.4);border-radius:16px;padding:28px;text-align:center;transition:border-color .2s,background .2s;cursor:pointer}
+.import-zone-sql:hover,.import-zone-sql.dragover{border-color:rgba(245,158,11,.9);background:rgba(245,158,11,.07)}
+.import-zone-sql input[type=file]{display:none}
 .stat-pill{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);border-radius:14px;padding:16px 20px;text-align:center}
 .stat-pill .val{font-size:1.8rem;font-weight:900;color:#a5b4fc}
 .stat-pill .lbl{font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
 .danger-zone{border:1px solid rgba(239,68,68,.3);border-radius:16px;padding:20px;background:rgba(239,68,68,.05)}
 .backup-row{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:rgba(255,255,255,.04);border-radius:10px;margin-bottom:6px;font-size:.85rem}
+/* Onglets import internes */
+.inner-tabs{display:flex;gap:4px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:4px;margin-bottom:20px}
+.inner-tabs button{flex:1;padding:8px 12px;border:none;border-radius:9px;background:transparent;color:var(--muted);font-weight:700;font-size:.82rem;cursor:pointer;transition:all .15s}
+.inner-tabs button.active{background:rgba(99,102,241,.25);color:#fff;border:1px solid rgba(99,102,241,.4)}
+.inner-tabs button:hover:not(.active){background:rgba(255,255,255,.06);color:#fff}
+.import-panel{display:none}
+.import-panel.active{display:block}
 </style>
 </head>
 <body>
@@ -684,13 +795,11 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
     </a>
     <a href="admin.php?tab=historique"   class="<?= $tab === 'historique'   ? 'active' : '' ?>"><i class="bi bi-clock-history me-1"></i>Historique QR</a>
     <a href="admin.php?tab=import"       class="<?= $tab === 'import'       ? 'active' : '' ?>" style="<?= $tab === 'import' ? '' : 'color:#f59e0b' ?>">
-      <i class="bi bi-database-up me-1"></i>Import de base de données
+      <i class="bi bi-database-up me-1"></i>Import / Export
     </a>
   </nav>
 
-  <!-- ════════════════════════════════════
-       ONGLET ÉQUIPEMENTS
-  ════════════════════════════════════ -->
+  <!-- ════════ ONGLETS ÉQUIPEMENTS / UTILISATEURS / RÉPARATIONS / HISTORIQUE ════════ -->
   <?php if ($tab === 'equipements'): ?>
   <div class="row g-4">
     <div class="col-lg-4">
@@ -763,9 +872,6 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
     </div>
   </div>
 
-  <!-- ════════════════════════════════════
-       ONGLET UTILISATEURS
-  ════════════════════════════════════ -->
   <?php elseif ($tab === 'utilisateurs'): ?>
   <div class="row g-4">
     <div class="col-lg-4">
@@ -815,15 +921,11 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
     </div>
   </div>
 
-  <!-- ════════════════════════════════════
-       ONGLET RÉPARATIONS
-  ════════════════════════════════════ -->
   <?php elseif ($tab === 'reparations'): ?>
   <?php if (!$repTableOk): ?>
   <div class="alert alert-warning">La table <code>reparations</code> est introuvable. Exécutez votre script SQL de mise à jour.</div>
   <?php else: ?>
   <div class="row g-4">
-    <!-- Formulaire ouverture -->
     <div class="col-lg-4">
       <div class="glass p-4">
         <div class="section-title"><i class="bi bi-plus-circle me-2" style="color:#fbbf24"></i>Ouvrir une réparation</div>
@@ -849,7 +951,6 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
         </form>
       </div>
     </div>
-    <!-- Réparations en cours -->
     <div class="col-lg-8">
       <div class="glass p-4">
         <div class="section-title"><i class="bi bi-wrench me-2" style="color:#f59e0b"></i>En cours (<?= count($reparations) ?>)</div>
@@ -884,16 +985,12 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
           </div>
           <div class="muted small mt-1"><?= hv(mb_substr($r['panne_declaree'] ?? '', 0, 120)) ?></div>
           <?php if ($r['technicien'] ?? ''): ?><div class="muted" style="font-size:.75rem;margin-top:2px"><i class="bi bi-person me-1"></i><?= hv($r['technicien']) ?></div><?php endif; ?>
-          <!-- Barre workflow -->
           <div class="wf-bar">
             <?php foreach ($wfSteps as $i => $step):
-                $done = ($i + 1) <= $wfPos;
-                $active = ($i + 1) === $wfPos;
-            ?>
+                $done = ($i + 1) <= $wfPos; $active = ($i + 1) === $wfPos; ?>
             <div style="background:<?= $active ? '#f59e0b' : ($done ? '#22c55e' : 'rgba(255,255,255,.10)') ?>;flex:1;height:6px;border-radius:3px" title="<?= hv($step) ?>"></div>
             <?php endforeach; ?>
           </div>
-          <!-- Actions -->
           <div class="d-flex gap-2 mt-3 flex-wrap">
             <form method="post" action="admin.php?tab=reparations" class="d-flex gap-2 align-items-center flex-wrap">
               <input type="hidden" name="action" value="update_repair">
@@ -913,7 +1010,6 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
         <?php endforeach; ?>
         <?php endif; ?>
       </div>
-      <!-- Réparations clôturées -->
       <?php if (!empty($closedRepairs)): ?>
       <div class="glass p-4 mt-4">
         <div class="section-title"><i class="bi bi-archive me-2" style="color:#22c55e"></i>Clôturées (<?= count($closedRepairs) ?>)</div>
@@ -939,9 +1035,6 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
   </div>
   <?php endif; ?>
 
-  <!-- ════════════════════════════════════
-       ONGLET HISTORIQUE QR
-  ════════════════════════════════════ -->
   <?php elseif ($tab === 'historique'): ?>
   <div class="row g-4">
     <div class="col-lg-4">
@@ -998,96 +1091,112 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
   </div>
 
   <!-- ════════════════════════════════════
-       ONGLET IMPORT DE BASE DE DONNÉES
+       ONGLET IMPORT / EXPORT
   ════════════════════════════════════ -->
   <?php elseif ($tab === 'import'): ?>
 
-  <!-- Statistiques base -->
+  <!-- Stats base -->
   <div class="row g-3 mb-4">
     <div class="col-sm-4">
-      <div class="stat-pill">
-        <div class="val"><?= $dbStats['equipements'] ?? 0 ?></div>
-        <div class="lbl"><i class="bi bi-laptop me-1"></i>Équipements</div>
-      </div>
+      <div class="stat-pill"><div class="val"><?= $dbStats['equipements'] ?? 0 ?></div><div class="lbl"><i class="bi bi-laptop me-1"></i>Équipements</div></div>
     </div>
     <div class="col-sm-4">
-      <div class="stat-pill">
-        <div class="val"><?= $dbStats['utilisateurs'] ?? 0 ?></div>
-        <div class="lbl"><i class="bi bi-people me-1"></i>Utilisateurs</div>
-      </div>
+      <div class="stat-pill"><div class="val"><?= $dbStats['utilisateurs'] ?? 0 ?></div><div class="lbl"><i class="bi bi-people me-1"></i>Utilisateurs</div></div>
     </div>
     <div class="col-sm-4">
-      <div class="stat-pill">
-        <div class="val"><?= $dbStats['reparations'] ?? 0 ?></div>
-        <div class="lbl"><i class="bi bi-tools me-1"></i>Réparations</div>
-      </div>
+      <div class="stat-pill"><div class="val"><?= $dbStats['reparations'] ?? 0 ?></div><div class="lbl"><i class="bi bi-tools me-1"></i>Réparations</div></div>
     </div>
   </div>
 
   <div class="row g-4">
 
-    <!-- ── Colonne gauche : Import CSV ── -->
+    <!-- ── Colonne gauche : Import CSV + SQL ── -->
     <div class="col-lg-6">
       <div class="glass p-4">
-        <div class="section-title"><i class="bi bi-file-earmark-spreadsheet me-2" style="color:#4ade80"></i>Import CSV — Équipements</div>
-        <p class="muted small mb-3">Importez un grand nombre d'équipements en une seule fois à partir d'un fichier CSV. Les colonnes reconnues sont détectées automatiquement.</p>
+        <div class="section-title"><i class="bi bi-cloud-upload me-2" style="color:#4ade80"></i>Importer des données</div>
 
-        <form method="post" action="admin.php?tab=import" enctype="multipart/form-data" id="csvForm">
-          <input type="hidden" name="action" value="import_csv">
+        <!-- Sous-onglets CSV / SQL -->
+        <div class="inner-tabs">
+          <button id="tab-csv" class="active" onclick="switchImportTab('csv')"><i class="bi bi-file-earmark-spreadsheet me-1"></i>CSV — Équipements</button>
+          <button id="tab-sql" onclick="switchImportTab('sql')"><i class="bi bi-file-earmark-code me-1"></i>SQL — Restauration complète</button>
+        </div>
 
-          <!-- Zone de dépôt -->
-          <label class="import-zone mb-3" id="dropZone" for="csvFileInput">
-            <input type="file" name="csv_file" id="csvFileInput" accept=".csv,text/csv">
-            <i class="bi bi-upload" style="font-size:2.5rem;color:#6366f1;display:block;margin-bottom:10px"></i>
-            <div class="fw-bold">Cliquez ou déposez votre fichier CSV ici</div>
-            <div class="muted small mt-1" id="fileNameDisplay">Aucun fichier sélectionné</div>
-          </label>
-
-          <div class="mb-3">
-            <label class="form-label">Séparateur de colonnes</label>
-            <select name="csv_sep" class="form-select">
-              <option value=";">Point-virgule ( ; ) — par défaut Excel FR</option>
-              <option value=",">Virgule ( , ) — CSV standard</option>
-              <option value="&#9;">Tabulation ( TAB )</option>
-            </select>
-          </div>
-
-          <button type="submit" class="btn btn-success w-100 fw-bold" id="importBtn">
-            <i class="bi bi-cloud-upload me-2"></i>Lancer l'import CSV
-          </button>
-        </form>
-
-        <!-- Aide colonnes -->
-        <div class="mt-4">
-          <div class="section-title" style="font-size:.82rem;color:var(--muted)"><i class="bi bi-info-circle me-1"></i>Colonnes reconnues</div>
-          <div class="row g-1">
-            <?php
-            $colsDoc = [
-                ['nom',                   'Obligatoire', '#22c55e'],
-                ['type',                  'Obligatoire', '#22c55e'],
-                ['numero_serie',          'Obligatoire', '#22c55e'],
-                ['localisation / site',   'Obligatoire', '#22c55e'],
-                ['statut',                'Optionnel',   '#f59e0b'],
-                ['qr_code / qr',          'Optionnel',   '#f59e0b'],
-                ['marque',                'Optionnel',   '#f59e0b'],
-                ['modele',                'Optionnel',   '#f59e0b'],
-                ['categorie',             'Optionnel',   '#f59e0b'],
-                ['date_achat',            'Optionnel',   '#f59e0b'],
-                ['garantie_fin',          'Optionnel',   '#f59e0b'],
-                ['commentaire_technique', 'Optionnel',   '#f59e0b'],
-                ['criticite',             'Optionnel',   '#f59e0b'],
-                ['etat_reparation',       'Optionnel',   '#f59e0b'],
-            ];
-            foreach ($colsDoc as [$col, $req, $color]): ?>
-            <div class="col-6">
-              <div style="background:rgba(255,255,255,.04);border:1px solid <?= $color ?>33;border-radius:8px;padding:5px 9px;font-size:.75rem;margin-bottom:4px">
-                <code style="color:<?= $color ?>"><?= $col ?></code>
-                <span style="color:var(--muted);font-size:.68rem;display:block"><?= $req ?></span>
-              </div>
+        <!-- Panneau CSV -->
+        <div id="panel-csv" class="import-panel active">
+          <p class="muted small mb-3">Importez des équipements en masse depuis un fichier CSV. Les colonnes sont détectées automatiquement.</p>
+          <form method="post" action="admin.php?tab=import" enctype="multipart/form-data" id="csvForm">
+            <input type="hidden" name="action" value="import_csv">
+            <label class="import-zone mb-3" id="dropZoneCsv" for="csvFileInput">
+              <input type="file" name="csv_file" id="csvFileInput" accept=".csv,text/csv">
+              <i class="bi bi-file-earmark-spreadsheet" style="font-size:2.2rem;color:#4ade80;display:block;margin-bottom:8px"></i>
+              <div class="fw-bold">Cliquez ou déposez votre fichier CSV ici</div>
+              <div class="muted small mt-1" id="csvFileName">Aucun fichier sélectionné</div>
+            </label>
+            <div class="mb-3">
+              <label class="form-label">Séparateur de colonnes</label>
+              <select name="csv_sep" class="form-select">
+                <option value=";">Point-virgule ( ; ) — défaut Excel FR</option>
+                <option value=",">Virgule ( , ) — CSV standard</option>
+                <option value="&#9;">Tabulation ( TAB )</option>
+              </select>
             </div>
-            <?php endforeach; ?>
+            <button type="submit" class="btn btn-success w-100 fw-bold"><i class="bi bi-cloud-upload me-2"></i>Lancer l'import CSV</button>
+          </form>
+          <!-- Colonnes reconnues -->
+          <div class="mt-4">
+            <div class="section-title" style="font-size:.82rem;color:var(--muted)"><i class="bi bi-info-circle me-1"></i>Colonnes reconnues</div>
+            <div class="row g-1">
+              <?php
+              $colsDoc = [
+                  ['nom',                   'Obligatoire', '#22c55e'],
+                  ['type',                  'Obligatoire', '#22c55e'],
+                  ['numero_serie',          'Obligatoire', '#22c55e'],
+                  ['localisation / site',   'Obligatoire', '#22c55e'],
+                  ['statut',                'Optionnel',   '#f59e0b'],
+                  ['qr_code / qr',          'Optionnel',   '#f59e0b'],
+                  ['marque',                'Optionnel',   '#f59e0b'],
+                  ['modele',                'Optionnel',   '#f59e0b'],
+                  ['categorie',             'Optionnel',   '#f59e0b'],
+                  ['date_achat',            'Optionnel',   '#f59e0b'],
+                  ['garantie_fin',          'Optionnel',   '#f59e0b'],
+                  ['commentaire_technique', 'Optionnel',   '#f59e0b'],
+                  ['criticite',             'Optionnel',   '#f59e0b'],
+                  ['etat_reparation',       'Optionnel',   '#f59e0b'],
+              ];
+              foreach ($colsDoc as [$col, $req, $color]): ?>
+              <div class="col-6">
+                <div style="background:rgba(255,255,255,.04);border:1px solid <?= $color ?>33;border-radius:8px;padding:5px 9px;font-size:.75rem;margin-bottom:4px">
+                  <code style="color:<?= $color ?>"><?= $col ?></code>
+                  <span style="color:var(--muted);font-size:.68rem;display:block"><?= $req ?></span>
+                </div>
+              </div>
+              <?php endforeach; ?>
+            </div>
           </div>
-          <p class="muted mt-2" style="font-size:.75rem"><i class="bi bi-lightbulb me-1"></i>Les colonnes absentes dans votre base sont ignorées automatiquement. QR code généré automatiquement si absent.</p>
+        </div>
+
+        <!-- Panneau SQL -->
+        <div id="panel-sql" class="import-panel">
+          <div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:12px;padding:12px 14px;margin-bottom:16px;font-size:.82rem">
+            <i class="bi bi-exclamation-triangle-fill me-2" style="color:#fbbf24"></i>
+            <strong style="color:#fbbf24">Restauration complète</strong>
+            <div class="muted mt-1">Cette opération recrée les tables et réinjecte toutes les données depuis un fichier <code>.sql</code> généré par ce système.<br>
+            Les tables existantes seront <strong>supprimées et recréées</strong>. À utiliser uniquement avec un dump produit ici.</div>
+          </div>
+          <form method="post" action="admin.php?tab=import" enctype="multipart/form-data" id="sqlForm">
+            <input type="hidden" name="action" value="import_sql">
+            <label class="import-zone-sql mb-3" id="dropZoneSql" for="sqlFileInput">
+              <input type="file" name="sql_file" id="sqlFileInput" accept=".sql,text/plain">
+              <i class="bi bi-file-earmark-code" style="font-size:2.2rem;color:#f59e0b;display:block;margin-bottom:8px"></i>
+              <div class="fw-bold">Cliquez ou déposez votre fichier .sql ici</div>
+              <div class="muted small mt-1" id="sqlFileName">Aucun fichier sélectionné</div>
+            </label>
+            <button type="submit" class="btn w-100 fw-bold" style="background:linear-gradient(135deg,#d97706,#b45309);color:#fff;border:none;border-radius:10px"
+              onclick="return confirm('⚠️ Restauration SQL\n\nLes tables existantes seront supprimées et recréées avec les données du fichier.\n\nConfirmez-vous ?')">
+              <i class="bi bi-arrow-counterclockwise me-2"></i>Restaurer depuis ce fichier SQL
+            </button>
+          </form>
+          <p class="muted mt-3" style="font-size:.75rem"><i class="bi bi-lightbulb me-1"></i>Pour restaurer depuis une sauvegarde ZIP, extrayez d'abord le fichier <code>.sql</code> et importez-le ici.</p>
         </div>
       </div>
     </div>
@@ -1096,7 +1205,23 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
     <div class="col-lg-6">
       <div class="glass p-4">
         <div class="section-title"><i class="bi bi-database me-2" style="color:#f59e0b"></i>Sauvegarde &amp; Réinitialisation</div>
-        <p class="muted small mb-4">Créez une sauvegarde complète de la base de données au format <code>.sql</code>, puis videz toutes les tables principales.</p>
+        <p class="muted small mb-4">Crée une sauvegarde complète (<code>.sql</code> + <code>.csv</code> par table + archive <code>.zip</code>), puis vide toutes les tables.</p>
+
+        <!-- Résumé de ce qui sera exporté -->
+        <div style="background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.2);border-radius:12px;padding:12px 14px;margin-bottom:16px;font-size:.82rem">
+          <div class="fw-bold mb-2" style="color:#a5b4fc"><i class="bi bi-archive me-1"></i>Contenu de la sauvegarde générée</div>
+          <div class="d-flex flex-wrap gap-2">
+            <span style="background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.3);color:#a5b4fc;padding:3px 10px;border-radius:8px;font-size:.75rem;font-family:monospace"><i class="bi bi-file-earmark-code me-1"></i>backup_DATE.sql</span>
+            <?php
+            $exportTables = ['equipements', 'utilisateurs', 'reparations', 'reparation_logs', 'equipement_logs', 'movements'];
+            foreach ($exportTables as $t): ?>
+            <span style="background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.25);color:#86efac;padding:3px 10px;border-radius:8px;font-size:.75rem;font-family:monospace"><i class="bi bi-file-earmark-spreadsheet me-1"></i><?= $t ?>.csv</span>
+            <?php endforeach; ?>
+            <?php if (class_exists('ZipArchive')): ?>
+            <span style="background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.25);color:#fcd34d;padding:3px 10px;border-radius:8px;font-size:.75rem;font-family:monospace"><i class="bi bi-file-zip me-1"></i>backup_DATE.zip</span>
+            <?php endif; ?>
+          </div>
+        </div>
 
         <div class="danger-zone">
           <div class="d-flex align-items-start gap-3 mb-3">
@@ -1105,12 +1230,11 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
             </div>
             <div>
               <div class="fw-bold" style="color:#fca5a5">Zone de danger</div>
-              <div class="muted small">Cette opération va vider toutes les tables. Un fichier <code>.sql</code> de sauvegarde sera automatiquement créé <strong>avant</strong> la suppression.</div>
+              <div class="muted small">Sauvegarde créée automatiquement <strong>avant</strong> la suppression. Opération irréversible sans la sauvegarde.</div>
             </div>
           </div>
-
           <div class="mb-3" style="background:rgba(255,255,255,.04);border-radius:10px;padding:12px">
-            <div class="fw-bold small mb-2"><i class="bi bi-list-check me-1"></i>Tables qui seront vidées :</div>
+            <div class="fw-bold small mb-2"><i class="bi bi-list-check me-1"></i>Tables vidées après sauvegarde :</div>
             <?php
             $resetTablesList = ['equipements', 'utilisateurs', 'reparations', 'reparation_logs', 'equipement_logs', 'movements'];
             foreach ($resetTablesList as $tbl):
@@ -1120,11 +1244,10 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
             </span>
             <?php endforeach; ?>
           </div>
-
           <form method="post" action="admin.php?tab=import" onsubmit="return confirmReset()">
             <input type="hidden" name="action" value="db_backup_reset">
             <button type="submit" class="btn btn-danger w-100 fw-bold">
-              <i class="bi bi-arrow-counterclockwise me-2"></i>Sauvegarder la base et réinitialiser
+              <i class="bi bi-arrow-counterclockwise me-2"></i>Sauvegarder (SQL + CSV + ZIP) et réinitialiser
             </button>
           </form>
         </div>
@@ -1140,7 +1263,13 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
           <?php foreach ($backupFiles as $bf): ?>
           <div class="backup-row">
             <div>
+              <?php if ($bf['type'] === 'zip'): ?>
+              <i class="bi bi-file-zip me-2" style="color:#fcd34d"></i>
+              <?php elseif ($bf['type'] === 'sql'): ?>
               <i class="bi bi-file-earmark-code me-2" style="color:#a5b4fc"></i>
+              <?php else: ?>
+              <i class="bi bi-file-earmark-spreadsheet me-2" style="color:#86efac"></i>
+              <?php endif; ?>
               <code style="font-size:.8rem;color:#e2e8f0"><?= hv($bf['name']) ?></code>
             </div>
             <div class="d-flex align-items-center gap-3">
@@ -1161,7 +1290,7 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
   <?php endif; ?>
 </div>
 
-<!-- MODAL CLÔTURE RÉPARATION -->
+<!-- MODALS (identiques à l'original) -->
 <div class="modal fade" id="modalCloseRepair" tabindex="-1">
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content" style="background:#1e293b;border:1px solid rgba(255,255,255,.12);border-radius:20px;color:var(--txt)">
@@ -1195,7 +1324,6 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
   </div>
 </div>
 
-<!-- MODAL ÉDITION ÉQUIPEMENT -->
 <div class="modal fade" id="modalEditEquip" tabindex="-1">
   <div class="modal-dialog modal-dialog-centered modal-lg">
     <div class="modal-content" style="background:#1e293b;border:1px solid rgba(255,255,255,.12);border-radius:20px;color:var(--txt)">
@@ -1233,7 +1361,6 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
   </div>
 </div>
 
-<!-- MODAL ÉDITION UTILISATEUR -->
 <div class="modal fade" id="modalEditUser" tabindex="-1">
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content" style="background:#1e293b;border:1px solid rgba(255,255,255,.12);border-radius:20px;color:var(--txt)">
@@ -1268,6 +1395,52 @@ body{min-height:100vh;color:var(--txt);font-family:system-ui,-apple-system,sans-
   inp.addEventListener('input', function(){
     const v = inp.value.toLowerCase();
     rows.forEach(r => r.style.display = (!v || (r.dataset.search||'').includes(v)) ? '' : 'none');
+  });
+})();
+
+/* ── Sous-onglets import CSV / SQL ── */
+function switchImportTab(tab) {
+  ['csv','sql'].forEach(t => {
+    document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+    document.getElementById('panel-' + t).classList.toggle('active', t === tab);
+  });
+}
+
+/* ── Drag & drop + nom de fichier CSV ── */
+(function(){
+  const zone  = document.getElementById('dropZoneCsv');
+  const input = document.getElementById('csvFileInput');
+  const label = document.getElementById('csvFileName');
+  if (!zone || !input) return;
+  input.addEventListener('change', () => { label.textContent = input.files[0] ? input.files[0].name : 'Aucun fichier sélectionné'; });
+  zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('dragover');
+    if (e.dataTransfer.files[0]) {
+      const dt = new DataTransfer(); dt.items.add(e.dataTransfer.files[0]);
+      input.files = dt.files;
+      label.textContent = e.dataTransfer.files[0].name;
+    }
+  });
+})();
+
+/* ── Drag & drop + nom de fichier SQL ── */
+(function(){
+  const zone  = document.getElementById('dropZoneSql');
+  const input = document.getElementById('sqlFileInput');
+  const label = document.getElementById('sqlFileName');
+  if (!zone || !input) return;
+  input.addEventListener('change', () => { label.textContent = input.files[0] ? input.files[0].name : 'Aucun fichier sélectionné'; });
+  zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('dragover');
+    if (e.dataTransfer.files[0]) {
+      const dt = new DataTransfer(); dt.items.add(e.dataTransfer.files[0]);
+      input.files = dt.files;
+      label.textContent = e.dataTransfer.files[0].name;
+    }
   });
 })();
 
@@ -1329,38 +1502,16 @@ function copyTicket(el, val) {
   }).catch(() => prompt('N° de ticket :', val));
 }
 
-/* ── Import CSV : drag & drop + preview nom fichier ── */
-(function(){
-  const zone  = document.getElementById('dropZone');
-  const input = document.getElementById('csvFileInput');
-  const label = document.getElementById('fileNameDisplay');
-  if (!zone || !input) return;
-
-  input.addEventListener('change', function(){
-    label.textContent = input.files[0] ? input.files[0].name : 'Aucun fichier sélectionné';
-  });
-
-  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
-  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
-  zone.addEventListener('drop', e => {
-    e.preventDefault(); zone.classList.remove('dragover');
-    if (e.dataTransfer.files[0]) {
-      const dt = new DataTransfer();
-      dt.items.add(e.dataTransfer.files[0]);
-      input.files = dt.files;
-      label.textContent = e.dataTransfer.files[0].name;
-    }
-  });
-})();
-
 /* ── Confirmation reset base ── */
 function confirmReset() {
   return confirm(
     '⚠️ ATTENTION — Réinitialisation de la base\n\n' +
     'Cette action va :\n' +
     '1. Créer une sauvegarde .sql complète\n' +
-    '2. Vider toutes les tables (équipements, utilisateurs, réparations, logs…)\n\n' +
-    'Cette opération est IRRÉVERSIBLE sans la sauvegarde.\n\n' +
+    '2. Créer un fichier .csv pour chaque table\n' +
+    '3. Regrouper tout dans une archive .zip\n' +
+    '4. Vider toutes les tables\n\n' +
+    'Opération IRRÉVERSIBLE sans la sauvegarde.\n\n' +
     'Confirmez-vous la réinitialisation ?'
   );
 }
